@@ -7,6 +7,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from tqdm import tqdm
+
 
 DEFAULT_VAE_PATH = "/mnt/ddn/zhenhao_team/models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth"
 
@@ -88,11 +90,12 @@ def encode_video(
 
 @torch.inference_mode()
 def batch_process_dir(dir_source, dir_target, vae_path=DEFAULT_VAE_PATH) -> list[Path]:
-    """Encode each MP4 in a directory, loading the VAE once for the whole batch.
+    """Encode MP4s whose filenames contain ``bustling``, loading the VAE once.
 
     Args:
         dir_source: Directory containing the input videos. Only immediate
-            files with a ``.mp4`` extension (case insensitive) are processed.
+            files with a ``.mp4`` extension (case insensitive) and ``bustling``
+            in their filename (case sensitive) are processed.
         dir_target: Output directory, created automatically if needed.
             ``clip.mp4`` is saved as ``clip.pt``; existing outputs are replaced.
         vae_path: VAE checkpoint or checkpoint directory, with the same default
@@ -123,9 +126,22 @@ def batch_process_dir(dir_source, dir_target, vae_path=DEFAULT_VAE_PATH) -> list
 
     vae = _load_vae(vae_path)
     output_paths = []
-    for video_path in video_paths:
+    for video_path in tqdm(video_paths):
+        if "bustling" not in video_path.name:
+            continue
         latent = _encode_video_with_vae(video_path, vae)
         output_path = dir_target / video_path.with_suffix(".pt").name
         torch.save(latent, output_path)
         output_paths.append(output_path)
     return output_paths
+
+
+if __name__  == '__main__':
+    # dir_source = '/mnt/ddn/george/diffusion/john-AR/vbench_results/261001_dawood-double_cache_14b_baseline_iter12k_bidirectional/videos_vbench'
+    # dir_target = 'temp/1001_bid'
+
+    dir_source = '/mnt/ddn/george/diffusion/john-AR/vbench_results/261001_dawood-double_cache_14b_baseline_iter12k/videos_vbench'
+    dir_target = 'temp/1001_dc'
+
+    batch_process_dir(dir_source, dir_target)
+    print("Voila.")

@@ -15,10 +15,12 @@ class AttentionMapCollector:
     cache keys before any pooling.
     """
 
-    def __init__(self, query_size=26):
+    def __init__(self, query_size=26, per_head=False):
         if query_size <= 0:
             raise ValueError("query_size must be positive")
         self.query_size = query_size
+        self.per_head = per_head
+        self.num_heads = None
         self.maps = []
         self.query_tokens = []
         self.key_tokens = []
@@ -82,6 +84,10 @@ class AttentionMapCollector:
             key_start, current_start + query.shape[1],
         )
         layout = tuple((index, tuple(spans)) for index, spans in key_chunks)
+        if self.num_heads is None:
+            self.num_heads = query.shape[2]
+        elif query.shape[2] != self.num_heads:
+            raise ValueError("Attention head count changed during collection")
         shape = (query.shape[1], key.shape[1], frame_tokens, sink_key_tokens, layout)
         if self._shape is None:
             self._shape = shape
@@ -153,7 +159,10 @@ class AttentionMapCollector:
             query_edges[1:], torch.arange(query_length, device=query.device), right=True
         )
         query_counts = (query_edges[1:] - query_edges[:-1]).float()
-        sums = torch.zeros((batch, size, key_length), dtype=torch.float32, device=query.device)
+        if self.per_head:
+            sums = torch.zeros((batch, heads, size, key_length), dtype=torch.float32, device=query.device)
+        else:
+            sums = torch.zeros((batch, size, key_length), dtype=torch.float32, device=query.device)
 
         # Bound peak memory by computing all-key softmax for small query/head
         # batches. Sum probabilities into query rows after softmax, not logits.
@@ -164,13 +173,21 @@ class AttentionMapCollector:
                 row_end = min(row_start + 64, query_length)
                 queries = query[:, row_start:row_end, head_start:head_end].permute(0, 2, 1, 3).float()
                 logits = queries @ keys * (1.0 / math.sqrt(head_dim))
-                probabilities = torch.softmax(logits, dim=-1).sum(dim=1) / heads
-                sums.index_add_(1, query_bins[row_start:row_end], probabilities)
-        row_means = sums / query_counts[None, :, None]
+                probabilities = torch.softmax(logits, dim=-1)
+                if self.per_head:
+                    sums[:, head_start:head_end].index_add_(
+                        2, query_bins[row_start:row_end], probabilities
+                    )
+                else:
+                    sums.index_add_(
+                        1, query_bins[row_start:row_end], probabilities.sum(dim=1) / heads
+                    )
+        row_means = (sums / query_counts[None, None, :, None] if self.per_head
+                     else sums / query_counts[None, :, None])
 
         blocks = []
         for spans in key_chunks:
-            values = torch.cat([row_means[:, :, start:end] for start, end in spans], dim=-1)
+            values = torch.cat([row_means[..., start:end] for start, end in spans], dim=-1)
             token_count = values.shape[-1]
             if token_count < size:
                 raise ValueError(f"A visible key chunk needs at least {size} tokens for disjoint pooling")
@@ -181,13 +198,36 @@ class AttentionMapCollector:
             bins = torch.searchsorted(
                 edges[1:], torch.arange(token_count, device=query.device), right=True
             )
-            block = torch.zeros((batch, size, size), dtype=torch.float32, device=query.device)
-            block.scatter_add_(2, bins[None, None].expand(batch, size, -1), values)
-            block /= (edges[1:] - edges[:-1]).float()[None, None, :]
+            block = torch.zeros((*values.shape[:-1], size), dtype=torch.float32, device=query.device)
+            bin_shape = (1,) * (values.ndim - 1) + (token_count,)
+            block.scatter_add_(-1, bins.reshape(bin_shape).expand_as(values), values)
+            count_shape = (1,) * (values.ndim - 1) + (size,)
+            block /= (edges[1:] - edges[:-1]).float().reshape(count_shape)
             blocks.append(block)
         return torch.cat(blocks, dim=-1).cpu()
 
     def sample(self, index):
+        """Return the original maps averaged over heads and layers."""
+        return self._sample_data(
+            [[step[index].mean(dim=0) if self.per_head else step[index]
+              for step in chunk] for chunk in self.maps],
+            "conditional causal self-attention; mean over heads and layers",
+        )
+
+    def sample_head(self, index, head_index):
+        """Return one head's maps, averaged over transformer layers."""
+        if not self.per_head:
+            raise ValueError("Per-head maps were not collected")
+        if not 0 <= head_index < self.num_heads:
+            raise IndexError(f"Attention head {head_index} is out of range")
+        data = self._sample_data(
+            [[step[index, head_index] for step in chunk] for chunk in self.maps],
+            f"conditional causal self-attention; head {head_index}; mean over layers",
+        )
+        data["head_index"] = head_index
+        return data
+
+    def _sample_data(self, maps, source):
         # maps[generated_chunk][step] is [26, 26 * visible_key_chunks].
         # Consecutive 26-column blocks follow key_chunk_indices[chunk][step].
         # Those indices refer to chunk_frames (which includes initial context
@@ -198,7 +238,7 @@ class AttentionMapCollector:
         # records how many retained keys contributed to each block.
         # frame_tokens spatial patches per frame are in row-major order.
         return {
-            "maps": [[step[index] for step in chunk] for chunk in self.maps],
+            "maps": maps,
             "query_tokens": self.query_tokens,
             "key_tokens": self.key_tokens,
             "frame_tokens": self.frame_tokens,
@@ -209,7 +249,8 @@ class AttentionMapCollector:
             "map_chunk_indices": self.map_chunk_indices,
             "timesteps": self.timesteps,
             "query_size": self.query_size,
+            "num_heads": self.num_heads,
             "format_version": 2,
             "pooling": "disjoint mean of post-softmax probabilities within each chunk",
-            "source": "conditional causal self-attention; mean over heads and layers",
+            "source": source,
         }

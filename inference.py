@@ -37,7 +37,11 @@ parser.add_argument("--save_with_index", action="store_true",
                     help="Whether to save the video using the index or prompt as the filename")
 parser.add_argument("--att_map", action="store_true",
                     help="Save per-chunk, per-step self-attention maps alongside each video")
+parser.add_argument("--per_head", action="store_true",
+                    help="With --att_map, save one file per head under output_folder/per_head")
 args = parser.parse_args()
+if args.per_head and not args.att_map:
+    parser.error("--per_head requires --att_map")
 
 # Initialize distributed inference
 if "LOCAL_RANK" in os.environ:
@@ -103,9 +107,12 @@ else:
     sampler = SequentialSampler(dataset)
 dataloader = DataLoader(dataset, batch_size=1, sampler=sampler, num_workers=0, drop_last=False)
 
-# Create output directory (only on main process to avoid race conditions)
+# Create output directories (only on main process to avoid race conditions)
+per_head_folder = os.path.join(args.output_folder, "per_head") if args.per_head else None
 if local_rank == 0:
     os.makedirs(args.output_folder, exist_ok=True)
+    if per_head_folder is not None:
+        os.makedirs(per_head_folder, exist_ok=True)
 
 if dist.is_initialized():
     dist.barrier()
@@ -167,7 +174,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         )
 
     # Attach only for this prompt; only denoising calls are captured.
-    att_map_collector = AttentionMapCollector() if args.att_map else None
+    att_map_collector = AttentionMapCollector(per_head=args.per_head) if args.att_map else None
     capture = (att_map_collector.attach(pipeline.generator.model)
                if att_map_collector is not None else nullcontext())
     with capture:
@@ -206,6 +213,13 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
                 att_map_path = os.path.join(os.path.dirname(output_path), f"attmap_{stem}.pth")
                 torch.save(att_map_collector.sample(seed_idx), att_map_path)
                 print(f"Saved Att maps to: {att_map_path}")
+                if args.per_head:
+                    for head_index in range(att_map_collector.num_heads):
+                        head_path = os.path.join(
+                            per_head_folder, f"attmap_{stem}_head_{head_index:02d}.pth"
+                        )
+                        torch.save(att_map_collector.sample_head(seed_idx, head_index), head_path)
+                        print(f"Saved head {head_index} Att maps to: {head_path}")
 
 
 from flicker_metric.temporal_flickering_ratio import compute_temporal_flickering_ratio_video_paths

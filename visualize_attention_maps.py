@@ -27,7 +27,7 @@ def normalize_to_uint8(image: torch.Tensor) -> torch.Tensor:
     return (image * (255.0 / maximum)).round().clamp(0, 255).to(torch.uint8)
 
 
-def load_grid(path: Path) -> list[list[torch.Tensor]]:
+def load_grid(path: Path) -> tuple[list[list[torch.Tensor]], dict]:
     data = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(data, dict) or "maps" not in data:
         raise ValueError(f"{path}: expected a dictionary with a 'maps' entry")
@@ -48,24 +48,29 @@ def load_grid(path: Path) -> list[list[torch.Tensor]]:
                 )
             if not torch.isfinite(cell).all() or (cell < 0).any():
                 raise ValueError(f"{path}: maps[{chunk_index}][{step_index}] has invalid values")
-    return maps
+    return maps, data
+
+
+def step_image(maps: list[list[torch.Tensor]], step_index: int) -> torch.Tensor:
+    """Place each query chunk's visible key blocks in the square image."""
+    side = BLOCK_SIZE * len(maps)
+    grid = torch.zeros((side, side), dtype=torch.float32)
+    for chunk_index, chunk in enumerate(maps):
+        width = BLOCK_SIZE * (chunk_index + 1)
+        grid[BLOCK_SIZE * chunk_index:BLOCK_SIZE * (chunk_index + 1), :width] = (
+            chunk[step_index].float()
+        )
+    return normalize_to_uint8(grid)
 
 
 def render_file(path: Path, output_folder: Path) -> list[Path]:
-    maps = load_grid(path)
-    num_chunks, num_steps = len(maps), len(maps[0])
-    side = BLOCK_SIZE * num_chunks
+    maps, _ = load_grid(path)
+    num_steps = len(maps[0])
     images = []
     paths = []
 
     for step_index in range(num_steps):
-        grid = torch.zeros((side, side), dtype=torch.float32)
-        for chunk_index, chunk in enumerate(maps):
-            width = BLOCK_SIZE * (chunk_index + 1)
-            grid[BLOCK_SIZE * chunk_index:BLOCK_SIZE * (chunk_index + 1), :width] = (
-                chunk[step_index].float()
-            )
-        pixels = normalize_to_uint8(grid)
+        pixels = step_image(maps, step_index)
         output_path = output_folder / f"{path.stem}_step_{step_index + 1:03d}.png"
         iio.imwrite(output_path, pixels.numpy())
         images.append(pixels)
@@ -88,14 +93,17 @@ def block_weights(pixels: np.ndarray) -> np.ndarray:
     means = pixels.astype(np.float64).reshape(
         chunks, BLOCK_SIZE, chunks, BLOCK_SIZE
     ).mean(axis=(1, 3))
-    row_sums = means.sum(axis=1, keepdims=True)
+    return normalize_weight_rows(means)
+
+
+def normalize_weight_rows(weights: np.ndarray) -> np.ndarray:
+    row_sums = weights.sum(axis=1, keepdims=True)
     # An entirely black row has no attention mass and remains zero.
-    return np.divide(means, row_sums, out=np.zeros_like(means), where=row_sums > 0)
+    return np.divide(weights, row_sums, out=np.zeros_like(weights), where=row_sums > 0)
 
 
-def render_weight_image(path: Path) -> Path:
-    """Save a cold-to-warm heatmap beside one grayscale attention PNG."""
-    weights = block_weights(iio.imread(path))
+def render_weight_grid(weights: np.ndarray, output_path: Path) -> Path:
+    """Save an N x N, row-normalized chunk-weight heatmap."""
     chunks = weights.shape[0]
     figure, axes = plt.subplots(figsize=(max(4, 0.65 * chunks + 2), max(4, 0.65 * chunks + 2)))
     maximum = float(weights.max())
@@ -113,10 +121,59 @@ def render_weight_image(path: Path) -> Path:
                           ha="center", va="center", fontsize=8)
     figure.colorbar(plot, ax=axes, label="Row-normalized block weight")
     figure.tight_layout()
-    output_path = path.with_name(f"{path.stem}_weight.png")
     figure.savefig(output_path, dpi=150)
     plt.close(figure)
     return output_path
+
+
+def render_weight_image(path: Path) -> Path:
+    """Save a cold-to-warm heatmap beside one grayscale attention PNG."""
+    weights = block_weights(iio.imread(path))
+    return render_weight_grid(weights, path.with_name(f"{path.stem}_weight.png"))
+
+
+def render_per_head_file(path: Path, output_folder: Path) -> tuple[int, list[np.ndarray]]:
+    """Render a per-file chunk-weight average over all timesteps."""
+    maps, data = load_grid(path)
+    head_index = data.get("head_index")
+    if isinstance(head_index, bool) or not isinstance(head_index, int) or head_index < 0:
+        raise ValueError(f"{path}: expected a nonnegative integer 'head_index'")
+
+    step_weights = []
+    for step_index in range(len(maps[0])):
+        pixels = step_image(maps, step_index)
+        weights = block_weights(pixels.numpy())
+        step_weights.append(weights)
+
+    # Every timestep contributes equally to this file's N x N weight image.
+    average_weights = normalize_weight_rows(np.stack(step_weights).mean(axis=0))
+    output_path = output_folder / f"{path.stem}_average_weight.png"
+    print(render_weight_grid(average_weights, output_path))
+    return head_index, step_weights
+
+
+def render_per_head_folder(attention_folder: Path, output_folder: Path) -> None:
+    source = attention_folder / "per_head"
+    if not source.is_dir():
+        return
+    destination = output_folder / "per_head"
+    destination.mkdir(parents=True, exist_ok=True)
+    files = sorted(
+        path for path in source.iterdir()
+        if path.is_file() and path.suffix.lower() in {".pth", ".pt"}
+    )
+    by_head: dict[int, list[np.ndarray]] = {}
+    for path in files:
+        head_index, step_weights = render_per_head_file(path, destination)
+        by_head.setdefault(head_index, []).extend(step_weights)
+
+    for head_index, grids in sorted(by_head.items()):
+        if any(grid.shape != grids[0].shape for grid in grids[1:]):
+            raise ValueError(f"Head {head_index}: prompt maps have different chunk counts")
+        # Average every timestep from every prompt for this head.
+        average_weights = normalize_weight_rows(np.stack(grids).mean(axis=0))
+        output_path = destination / f"head_{head_index:02d}_all_prompts_weight.png"
+        print(render_weight_grid(average_weights, output_path))
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -185,6 +242,8 @@ def main(argv: list[str] | None = None) -> None:
             print(render_weight_image(png_path))
     else:
         print(f"No .pth or .pt files found in {args.attention_folder}")
+
+    render_per_head_folder(args.attention_folder, args.output_folder)
 
 
 if __name__ == "__main__":
